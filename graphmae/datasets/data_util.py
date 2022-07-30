@@ -1,29 +1,125 @@
 
 from collections import namedtuple, Counter
 import numpy as np
+import os.path as osp
 
 import torch
 import torch.nn.functional as F
+import scipy.sparse as sp
 
 import dgl
 from dgl.data import (
-    load_data, 
-    TUDataset, 
-    CoraGraphDataset, 
-    CiteseerGraphDataset, 
+    load_data,
+    DGLDataset,
+    TUDataset,
+    CoraGraphDataset,
+    CiteseerGraphDataset,
     PubmedGraphDataset
 )
+from dgl.data.utils import download, loadtxt
+from dgl.data.citation_graph import _preprocess_features
+from dgl.transforms import reorder_graph
 from ogb.nodeproppred import DglNodePropPredDataset
 from dgl.data.ppi import PPIDataset
 from dgl.dataloading import GraphDataLoader
 
+
 from sklearn.preprocessing import StandardScaler
+
+
+class SDCNDataset(DGLDataset):
+    _url_prefix = 'https://github.com/bdy9527/SDCN/raw/master'
+
+    def __init__(self,
+                 name,
+                 raw_dir=None,
+                 force_reload=False,
+                 verbose=True,
+                 transform=None):
+        assert name.lower() in ['acm', 'dblp']
+
+        super(SDCNDataset, self).__init__(name,
+                                          raw_dir=raw_dir,
+                                          force_reload=force_reload,
+                                          verbose=verbose,
+                                          transform=transform)
+
+    def process(self):
+        root = self.raw_path
+        filenames = osp.join(root, self.name.lower() + '{}.txt')
+        objnames = ['', '_label', '_graph']
+
+        features = loadtxt(filenames.format(objnames[0]), ' ')
+        features = sp.coo_matrix(features, dtype=float)
+        labels = loadtxt(filenames.format(objnames[1]), ' ').flatten()
+        graph = loadtxt(filenames.format(objnames[2]), ' ')
+
+        g = dgl.graph((graph[:, 0], graph[:, 1]), num_nodes=len(labels))
+
+        g.ndata['label'] = dgl.backend.tensor(labels)
+        g.ndata['feat'] = dgl.backend.tensor(
+            _preprocess_features(features),
+            dtype=dgl.backend.data_type_dict['float32'])
+        self._num_classes = len(np.unique(labels))
+        self._labels = labels
+        self._g = reorder_graph(
+            g, node_permute_algo='rcmk', edge_permute_algo='dst', store_ids=False)
+
+        if self.verbose:
+            print('Finished data loading and preprocessing.')
+            print('  NumNodes: {}'.format(self._g.number_of_nodes()))
+            print('  NumEdges: {}'.format(self._g.number_of_edges()))
+            print('  NumFeats: {}'.format(self._g.ndata['feat'].shape[1]))
+            print('  NumClasses: {}'.format(self.num_classes))
+
+    def __getitem__(self, idx):
+        assert idx == 0, "This dataset has only one graph"
+        if self._transform is None:
+            return self._g
+        else:
+            return self._transform(self._g)
+
+    def __len__(self):
+        return 1
+
+    def download(self):
+        dirs = {'data': ['', '_label'], 'graph': ['_graph']}
+        for d, suffices in dirs.items():
+            for suffix in suffices:
+                filename = f'{self.name.lower()}{suffix}.txt'
+                download(
+                    f'{self._url_prefix}/{d}/{filename}',
+                    osp.join(self.raw_path, filename))
+
+    @property
+    def num_classes(self):
+        return self._num_classes
+
+
+class ACMGraphDataset(SDCNDataset):
+    def __init__(self,
+                 raw_dir=None,
+                 force_reload=False,
+                 verbose=True,
+                 transform=None):
+        super().__init__('acm', raw_dir, force_reload, verbose, transform)
+
+
+class DBLPGraphDataset(SDCNDataset):
+    def __init__(self,
+                 raw_dir=None,
+                 force_reload=False,
+                 verbose=True,
+                 transform=None):
+        super().__init__('dblp', raw_dir, force_reload, verbose, transform)
 
 
 GRAPH_DICT = {
     "cora": CoraGraphDataset,
     "citeseer": CiteseerGraphDataset,
     "pubmed": PubmedGraphDataset,
+    "acm": ACMGraphDataset,
+    "dblp": DBLPGraphDataset,
     "ogbn-arxiv": DglNodePropPredDataset
 }
 
@@ -123,7 +219,7 @@ def load_inductive_dataset(dataset_name):
         valid_dataloader = [g]
         test_dataloader = valid_dataloader
         eval_train_dataloader = [train_g]
-        
+
     return train_dataloader, valid_dataloader, test_dataloader, eval_train_dataloader, num_features, num_classes
 
 
@@ -139,7 +235,7 @@ def load_graph_classification_dataset(dataset_name, deg4feat=False):
             feature_dim = 0
             for g, _ in dataset:
                 feature_dim = max(feature_dim, g.ndata["node_labels"].max().item())
-            
+
             feature_dim += 1
             for g, l in dataset:
                 node_label = g.ndata["node_labels"].view(-1)
@@ -165,7 +261,7 @@ def load_graph_classification_dataset(dataset_name, deg4feat=False):
             for g, l in dataset:
                 degrees = g.in_degrees()
                 degrees[degrees > MAX_DEGREES] = MAX_DEGREES
-                
+
                 feat = F.one_hot(degrees, num_classes=feature_dim).float()
                 g.ndata["attr"] = feat
     else:
@@ -173,7 +269,7 @@ def load_graph_classification_dataset(dataset_name, deg4feat=False):
         feature_dim = graph.ndata["attr"].shape[1]
 
     labels = torch.tensor([x[1] for x in dataset])
-    
+
     num_classes = torch.max(labels).item() + 1
     dataset = [(g.remove_self_loop().add_self_loop(), y) for g, y in dataset]
 

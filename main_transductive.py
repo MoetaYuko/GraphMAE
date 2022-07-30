@@ -14,12 +14,28 @@ from graphmae.utils import (
 from graphmae.datasets.data_util import load_dataset
 from graphmae.evaluation import node_classification_evaluation
 from graphmae.models import build_model
+from sklearn.cluster import KMeans
+from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score
+from graphmae.utils import clustering_accuracy
 
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 
 
-def pretrain(model, graph, feat, optimizer, max_epoch, device, scheduler, num_classes, lr_f, weight_decay_f, max_epoch_f, linear_prob, logger=None):
+@torch.no_grad()
+def eval_clustering(model, graph, num_classes):
+    model.eval()
+    embed = model.embed(graph, graph.ndata["feat"])
+    km_pred = KMeans(num_classes).fit_predict(embed.cpu().numpy())
+    y_np = graph.ndata["label"].cpu().numpy()
+    acc = clustering_accuracy(y_np, km_pred)
+    nmi = normalized_mutual_info_score(y_np, km_pred)
+    ari = adjusted_rand_score(y_np, km_pred)
+    # print(f"--- km_acc: {acc:.4f} km_nmi: {nmi:.4f} km_ari: {ari:.4f} ---")
+    return acc, nmi, ari
+
+
+def pretrain(model, graph, feat, optimizer, max_epoch, device, scheduler, num_classes, lr_f, weight_decay_f, max_epoch_f, linear_prob, skip_eval, logger=None):
     logging.info("start training..")
     graph = graph.to(device)
     x = feat.to(device)
@@ -43,7 +59,10 @@ def pretrain(model, graph, feat, optimizer, max_epoch, device, scheduler, num_cl
             logger.note(loss_dict, step=epoch)
 
         if (epoch + 1) % 200 == 0:
-            node_classification_evaluation(model, graph, x, num_classes, lr_f, weight_decay_f, max_epoch_f, device, linear_prob, mute=True)
+            if not skip_eval:
+                node_classification_evaluation(model, graph, x, num_classes, lr_f, weight_decay_f, max_epoch_f, device, linear_prob, mute=True)
+            acc, nmi, ari = eval_clustering(model, graph, num_classes)
+            epoch_iter.write(f"--- km_acc: {acc:.4f} km_nmi: {nmi:.4f} km_ari: {ari:.4f} ---")
 
     # return best_model
     return model
@@ -75,10 +94,14 @@ def main(args):
     use_scheduler = args.scheduler
 
     graph, (num_features, num_classes) = load_dataset(dataset_name)
+    graph = graph.to(device)
     args.num_features = num_features
 
     acc_list = []
     estp_acc_list = []
+    km_acc_list = []
+    km_nmi_list = []
+    km_ari_list = []
     for i, seed in enumerate(seeds):
         print(f"####### Run {i} for seed {seed}")
         set_random_seed(seed)
@@ -103,7 +126,7 @@ def main(args):
             
         x = graph.ndata["feat"]
         if not load_model:
-            model = pretrain(model, graph, x, optimizer, max_epoch, device, scheduler, num_classes, lr_f, weight_decay_f, max_epoch_f, linear_prob, logger)
+            model = pretrain(model, graph, x, optimizer, max_epoch, device, scheduler, num_classes, lr_f, weight_decay_f, max_epoch_f, linear_prob, args.skip_eval, logger)
             model = model.cpu()
 
         if load_model:
@@ -116,17 +139,30 @@ def main(args):
         model = model.to(device)
         model.eval()
 
-        final_acc, estp_acc = node_classification_evaluation(model, graph, x, num_classes, lr_f, weight_decay_f, max_epoch_f, device, linear_prob)
-        acc_list.append(final_acc)
-        estp_acc_list.append(estp_acc)
+        if not args.skip_eval:
+            final_acc, estp_acc = node_classification_evaluation(model, graph, x, num_classes, lr_f, weight_decay_f, max_epoch_f, device, linear_prob)
+            acc_list.append(final_acc)
+            estp_acc_list.append(estp_acc)
+
+        km_acc, km_nmi, km_ari = eval_clustering(model, graph, num_classes)
+        print(f"--- final km_acc: {km_acc:.4f} km_nmi: {km_nmi:.4f} km_ari: {km_ari:.4f} ---")
+        km_acc_list.append(km_acc)
+        km_nmi_list.append(km_nmi)
+        km_ari_list.append(km_ari)
 
         if logger is not None:
             logger.finish()
 
-    final_acc, final_acc_std = np.mean(acc_list), np.std(acc_list)
-    estp_acc, estp_acc_std = np.mean(estp_acc_list), np.std(estp_acc_list)
-    print(f"# final_acc: {final_acc:.4f}±{final_acc_std:.4f}")
-    print(f"# early-stopping_acc: {estp_acc:.4f}±{estp_acc_std:.4f}")
+    if not args.skip_eval:
+        final_acc, final_acc_std = np.mean(acc_list), np.std(acc_list)
+        estp_acc, estp_acc_std = np.mean(estp_acc_list), np.std(estp_acc_list)
+        print(f"# final_acc: {final_acc:.4f}±{final_acc_std:.4f}")
+        print(f"# early-stopping_acc: {estp_acc:.4f}±{estp_acc_std:.4f}")
+
+    km_acc, km_acc_std = np.mean(km_acc_list), np.std(km_acc_list)
+    km_nmi, km_nmi_std = np.mean(km_nmi_list), np.std(km_nmi_list)
+    km_ari, km_ari_std = np.mean(km_ari_list), np.std(km_ari_list)
+    print(f"# average km_acc: {km_acc:.4f}±{km_acc_std:.4f} km_nmi: {km_nmi:.4f}±{km_nmi_std:.4f} km_ari: {km_ari:.4f}±{km_ari_std:.4f}")
 
 
 # Press the green button in the gutter to run the script.

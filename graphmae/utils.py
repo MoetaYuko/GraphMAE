@@ -6,6 +6,10 @@ import logging
 from functools import partial
 import numpy as np
 
+from sklearn.metrics import confusion_matrix
+from scipy.optimize import linear_sum_assignment
+from sklearn.utils.multiclass import unique_labels
+
 import dgl
 
 import torch
@@ -98,6 +102,18 @@ def build_args():
     parser.add_argument("--batch_size", type=int, default=32)
     args = parser.parse_args()
     return args
+
+
+def compute_assignment(y_true, y_pred):
+    labels = unique_labels(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+    row_indices, col_indices = linear_sum_assignment(cm, maximize=True)
+    return labels, cm, row_indices, col_indices
+
+
+def clustering_accuracy(y_true, y_pred):
+    _, cm, row_indices, col_indices = compute_assignment(y_true, y_pred)
+    return cm[row_indices, col_indices].sum().astype(float) / np.sum(cm)
 
 
 def create_activation(name):
